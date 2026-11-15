@@ -23,10 +23,17 @@
  *    satisfiable. See src/strategy.ts and README for the full map.
  *  - Public signals (9), order verified live by fullProve + vary-one-
  *    input-at-a-time (scripts/probe-pub0.mjs, probe-pub1.mjs):
- *      [0] public-inputs hash (changes with matchId/turnNumber; the
- *          hash function itself is NOT identified — see README. The
- *          value is forwarded verbatim from fullProve, never computed
- *          locally.)
+ *      [0] the circuit's own public-inputs hash (changes with
+ *          matchId/turnNumber). Its hash function is NOT the /build
+ *          keccak256 audit formula — verified live (scripts/
+ *          probe-hash.mjs, probe-hash2.mjs): for a real proof the
+ *          keccak256 value differs from publicSignals[0], and so do
+ *          Poseidon over the same tuples in several field orders.
+ *          The circuit's [0] is therefore forwarded verbatim from
+ *          fullProve and NEVER used as the audit field (see
+ *          computePublicInputsHash below). This does not matter for
+ *          verification: the platform re-verifies the proof +
+ *          public_signals as returned.
  *      [1] commitment
  *      [2] matchId
  *      [3] turnNumber
@@ -41,8 +48,9 @@
 import { createHash } from "node:crypto";
 import * as snarkjs from "snarkjs";
 import { buildPoseidon } from "circomlibjs";
+import { keccak256, concat, numberToHex } from "viem";
 import type { GameState, Move, Strategy } from "./strategy.js";
-import { ACTION_CODE } from "./strategy.js";
+import { ACTION_CODE, CIRCUIT_VERSION_NUM } from "./strategy.js";
 
 export const VFY_POLICY_CIRCUIT = {
   network: "mainnet",
@@ -121,13 +129,68 @@ export async function computeCommitment(params: number[], salt: string): Promise
 }
 
 /**
+ * The /build public-inputs hash (policyProof.publicInputsHash audit
+ * field): keccak256 of ABI-packed fields, each padded to 32 bytes
+ * big-endian, in EXACTLY this field order:
+ *   [commitment, matchId, turn, selfBalance, opponentBalance,
+ *    action, amount, circuitVersion]
+ * with action as HOLD 0 / FORTIFY 1 / EXTRACT 2, amount 0 for HOLD /
+ * FORTIFY, and circuitVersion "v1" as 1. The matchId is a UUID: its
+ * dashes are stripped and it is parsed as hex.
+ *
+ * This is the value the platform independently computes from the game
+ * state it knows. It is an OPTIONAL audit pointer — the platform
+ * verifies the actual Groth16 proof + public_signals, so a correct
+ * hash alone does NOT pass a turn — but it must be THIS value, not
+ * publicSignals[0]: the circuit's [0] is a different, unidentified
+ * hash (see the header note above), verified live to differ from this
+ * formula.
+ *
+ * Returns the 0x-hex hash, or null when the matchId is not a UUID or
+ * a plain number (the spec formula cannot be applied to an opaque
+ * id, so the caller omits the optional field instead of guessing).
+ */
+export function computePublicInputsHash(
+  state: GameState,
+  move: Move,
+  commitment: string,
+): string | null {
+  let matchId: bigint;
+  if (typeof state.matchId === "number") {
+    matchId = BigInt(state.matchId);
+  } else {
+    const raw = state.matchId.trim();
+    const deDashed = raw.replace(/-/g, "");
+    if (/^[0-9a-fA-F]{32}$/.test(deDashed)) {
+      matchId = BigInt(`0x${deDashed}`);
+    } else if (/^-?\d+$/.test(raw)) {
+      matchId = BigInt(raw);
+    } else {
+      return null;
+    }
+  }
+  return keccak256(
+    concat([
+      numberToHex(BigInt(commitment), { size: 32 }),
+      numberToHex(matchId, { size: 32 }),
+      numberToHex(BigInt(state.turn), { size: 32 }),
+      numberToHex(BigInt(state.selfBalance), { size: 32 }),
+      numberToHex(BigInt(state.opponentBalance), { size: 32 }),
+      numberToHex(BigInt(ACTION_CODE[move.action]), { size: 32 }),
+      numberToHex(BigInt(move.amount ?? 0), { size: 32 }),
+      numberToHex(1n, { size: 32 }),
+    ]),
+  );
+}
+
+/**
  * Map a game state + move + strategy to the circuit's input signals.
- * matchId may be a number, a decimal string, or an opaque string id
- * (e.g. "st_...") — opaque ids are hashed to a field element, which
- * the platform must do identically for its own publicInputsHash; if
- * the platform sends numeric match ids, use them as-is. The
- * commitment MUST be the Poseidon value for these params+salt, or
- * fullProve fails the line-72 assert.
+ * matchId encoding (aligned with the platform's own treatment in the
+ * /build keccak formula): a UUID matchId is used as its hex value
+ * (dashes stripped); a numeric id is used as-is; any other opaque
+ * string id is hashed to a field element. The commitment MUST be the
+ * Poseidon value for these params+salt, or fullProve fails the
+ * line-72 assert.
  */
 export function toCircuitInput(
   state: GameState,
@@ -138,7 +201,9 @@ export function toCircuitInput(
   let matchId: string;
   if (typeof state.matchId === "number") matchId = String(state.matchId);
   else if (/^-?\d+$/.test(state.matchId.trim())) matchId = BigInt(state.matchId.trim()).toString();
-  else matchId = hashToField(state.matchId);
+  else if (/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(state.matchId.trim())) {
+    matchId = BigInt(`0x${state.matchId.trim().replace(/-/g, "")}`).toString();
+  } else matchId = hashToField(state.matchId);
   return {
     action: String(ACTION_CODE[move.action]),
     amount: String(move.amount ?? 0),
@@ -148,7 +213,7 @@ export function toCircuitInput(
     matchId,
     commitment,
     salt: strategy.salt,
-    circuitVersion: String(strategy.circuitVersion),
+    circuitVersion: String(CIRCUIT_VERSION_NUM),
     strategyParams: strategy.params.map((p) => String(p)),
   };
 }

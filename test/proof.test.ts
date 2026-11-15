@@ -2,19 +2,32 @@
  * Proof tests with a MOCKED prover (fast, labelled).
  *
  * The mock proves nothing — it only checks the wiring: circuit input
- * mapping, commitment computation, and the missing-artifacts error.
- * The REAL Groth16 proof is exercised in test/proof.real.test.ts.
+ * mapping, commitment computation, the /build keccak256 audit hash,
+ * and the missing-artifacts error. The REAL Groth16 proof is
+ * exercised in test/proof.real.test.ts.
+ *
+ * The strategy used here is an explicit TEST FIXTURE (params
+ * [10,0,0,0,0,0,0,0], salt "0") — it is not the agent's strategy
+ * (STRATEGY_PARAMS in src/strategy.ts is a TODO for the owner).
  */
 import { describe, expect, it } from "vitest";
 import {
   CircuitArtifactsMissingError,
   VFY_POLICY_CIRCUIT,
   computeCommitment,
+  computePublicInputsHash,
   generatePolicyProof,
   hashToField,
   toCircuitInput,
 } from "../src/proof.js";
-import { liveStrategy } from "../src/strategy.js";
+import type { Strategy } from "../src/strategy.js";
+
+const testStrategy: Strategy = {
+  id: "test-fixture",
+  circuitVersion: "v1",
+  params: [10, 0, 0, 0, 0, 0, 0, 0],
+  salt: "0",
+};
 
 describe("circuit constants", () => {
   it("matches /api/circuit-info (verified 14 Nov 2026)", () => {
@@ -53,10 +66,94 @@ describe("computeCommitment", () => {
   });
 });
 
-describe("toCircuitInput", () => {
-  const strategy = { ...liveStrategy(), salt: "0" };
+describe("computePublicInputsHash (/build keccak256 audit formula)", () => {
+  // Test vector from scripts/probe-hash.mjs (real run, 15 Nov 2026):
+  // commitment 16558...72347, UUID matchId, turn 3, 95/105, EXTRACT 10.
+  const vectorCommitment =
+    "16558278792999601739528827900028539763998923485550243417577873933892175672347";
+  const vectorState = {
+    matchId: "9f4e1b2a-1111-4000-8000-000000000001",
+    turn: 3,
+    selfBalance: 95,
+    opponentBalance: 105,
+  };
 
-  it("maps a live-strategy EXTRACT to circuit inputs", async () => {
+  it("matches the known keccak256 vector from the /build formula", () => {
+    expect(
+      computePublicInputsHash(vectorState, { action: "EXTRACT", amount: 10 }, vectorCommitment),
+    ).toBe("0x3c38a8e2c7815cd57ff22531305df06cf7c287cb828ef9a01601861333269bdf");
+  });
+
+  it("is a 0x-prefixed 32-byte hash and deterministic", () => {
+    const h = computePublicInputsHash(vectorState, { action: "EXTRACT", amount: 10 }, vectorCommitment);
+    expect(h).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(computePublicInputsHash(vectorState, { action: "EXTRACT", amount: 10 }, vectorCommitment)).toBe(h);
+  });
+
+  it("changes when any field changes", () => {
+    const base = computePublicInputsHash(vectorState, { action: "EXTRACT", amount: 10 }, vectorCommitment);
+    expect(
+      computePublicInputsHash({ ...vectorState, turn: 4 }, { action: "EXTRACT", amount: 10 }, vectorCommitment),
+    ).not.toBe(base);
+    expect(
+      computePublicInputsHash(
+        { ...vectorState, selfBalance: 96 },
+        { action: "EXTRACT", amount: 10 },
+        vectorCommitment,
+      ),
+    ).not.toBe(base);
+    expect(
+      computePublicInputsHash(vectorState, { action: "HOLD" }, vectorCommitment),
+    ).not.toBe(base);
+    expect(
+      computePublicInputsHash(vectorState, { action: "EXTRACT", amount: 9 }, vectorCommitment),
+    ).not.toBe(base);
+    expect(
+      computePublicInputsHash(vectorState, { action: "EXTRACT", amount: 10 }, "12345"),
+    ).not.toBe(base);
+  });
+
+  it("uses amount 0 for HOLD/FORTIFY", () => {
+    expect(computePublicInputsHash(vectorState, { action: "HOLD" }, vectorCommitment)).toBe(
+      computePublicInputsHash(vectorState, { action: "HOLD", amount: 0 }, vectorCommitment),
+    );
+  });
+
+  it("accepts a numeric matchId", () => {
+    const h = computePublicInputsHash(
+      { matchId: 7, turn: 1, selfBalance: 100, opponentBalance: 100 },
+      { action: "EXTRACT", amount: 10 },
+      vectorCommitment,
+    );
+    expect(h).toMatch(/^0x[0-9a-f]{64}$/);
+  });
+
+  it("returns null for an opaque non-UUID matchId (formula not applicable)", () => {
+    expect(
+      computePublicInputsHash(
+        { matchId: "st_abc_123", turn: 1, selfBalance: 100, opponentBalance: 100 },
+        { action: "EXTRACT", amount: 10 },
+        vectorCommitment,
+      ),
+    ).toBeNull();
+  });
+
+  it("is NOT the circuit's publicSignals[0] (verified live — different hash)", async () => {
+    // The real proof for the vector state has publicSignals[0] =
+    // 18054142780609337750274101543188595559682643761682875673550740777443638678843
+    // (scripts/probe-hash.mjs). The keccak audit value differs; the
+    // two must never be confused (see src/proof.ts header).
+    const h = computePublicInputsHash(vectorState, { action: "EXTRACT", amount: 10 }, vectorCommitment);
+    expect(BigInt(h as string).toString()).not.toBe(
+      "18054142780609337750274101543188595559682643761682875673550740777443638678843",
+    );
+  });
+});
+
+describe("toCircuitInput", () => {
+  const strategy = { ...testStrategy, salt: "0" };
+
+  it("maps an EXTRACT to circuit inputs", async () => {
     const commitment = await computeCommitment(strategy.params, "0");
     const input = toCircuitInput(
       { matchId: 7, turn: 3, selfBalance: 90, opponentBalance: 110 },
@@ -78,7 +175,18 @@ describe("toCircuitInput", () => {
     expect(input.strategyParams).toEqual(["10", "0", "0", "0", "0", "0", "0", "0"]);
   });
 
-  it("hashes opaque string match ids to a field element", async () => {
+  it("uses the UUID hex value as the circuit matchId (platform encoding)", async () => {
+    const commitment = await computeCommitment(strategy.params, "0");
+    const input = toCircuitInput(
+      { matchId: "9f4e1b2a-1111-4000-8000-000000000001", turn: 1, selfBalance: 100, opponentBalance: 100 },
+      { action: "EXTRACT", amount: 10 },
+      strategy,
+      commitment,
+    );
+    expect(input.matchId).toBe(BigInt("0x9f4e1b2a111140008000000000000001").toString());
+  });
+
+  it("hashes other opaque string match ids to a field element", async () => {
     const commitment = await computeCommitment(strategy.params, "0");
     const input = toCircuitInput(
       { matchId: "st_abc_123", turn: 1, selfBalance: 100, opponentBalance: 100 },
@@ -92,7 +200,7 @@ describe("toCircuitInput", () => {
 
 describe("generatePolicyProof (mocked prover)", () => {
   it("uses an injected prover and returns its proof verbatim", async () => {
-    const strategy = liveStrategy();
+    const strategy = testStrategy;
     const commitment = await computeCommitment(strategy.params, strategy.salt);
     const fake = { proof: { pi_a: ["1"] }, publicSignals: ["a", "b"] };
     const out = await generatePolicyProof(
@@ -106,7 +214,7 @@ describe("generatePolicyProof (mocked prover)", () => {
   });
 
   it("throws CircuitArtifactsMissingError without a prover or artifacts", async () => {
-    const strategy = liveStrategy();
+    const strategy = testStrategy;
     await expect(
       generatePolicyProof(
         { matchId: 1, turn: 1, selfBalance: 100, opponentBalance: 100 },
